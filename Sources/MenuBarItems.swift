@@ -68,10 +68,10 @@ final class MenuBarScanner: @unchecked Sendable {  // 内部状态都在 lock �
         ownerCache = ownerCache.filter { frames[$0.key] != nil }
 
         var items: [MenuBarItem] = []
-        var ownWindowID: CGWindowID?
+        var ownCandidates: [CGWindowID] = []
         for (id, f) in frames {
             if let ownFrame, abs(f.midX - ownFrame.midX) <= 2, abs(f.midY - ownFrame.midY) <= 2 {
-                ownWindowID = id
+                ownCandidates.append(id)
                 continue
             }
             guard let owner = ownerCache[id] else {
@@ -90,6 +90,10 @@ final class MenuBarScanner: @unchecked Sendable {  // 内部状态都在 lock �
         items.sort { $0.frame.minX < $1.frame.minX }
         // 时钟这类最右边的系统图标不会被挤掉，所有图标同时不在屏幕上只可能是菜单栏整体收起了
         let menuBarHidden = !frames.isEmpty && !frames.keys.contains(where: onScreen.contains)
+        // 进出全屏时新旧两套图标窗口会短暂并存，只认还在屏幕上的那个；仍有多个就当没认出
+        let ownOnScreen = ownCandidates.filter(onScreen.contains)
+        let ownPicked = ownOnScreen.isEmpty ? ownCandidates : ownOnScreen
+        let ownWindowID = ownPicked.count == 1 ? ownPicked.first : nil
         return Result(items: items, ownWindowID: ownWindowID, menuBarHidden: menuBarHidden)
     }
 
@@ -107,6 +111,7 @@ final class MenuBarScanner: @unchecked Sendable {  // 内部状态都在 lock �
     private func resolveOwners(for windowIDs: [CGWindowID], frames: [CGWindowID: CGRect]) {
         let started = Date()
         var pending = Set(windowIDs)
+        var matched: [(id: CGWindowID, element: AXUIElement, axFrame: CGRect, owner: Owner)] = []
         for app in NSWorkspace.shared.runningApplications where !pending.isEmpty {
             guard app.activationPolicy != .prohibited, !app.isTerminated else { continue }
             let pid = app.processIdentifier
@@ -123,16 +128,31 @@ final class MenuBarScanner: @unchecked Sendable {  // 内部状态都在 lock �
                 guard let id = match else { continue }
                 let desc: String = AX.attribute(child, kAXDescriptionAttribute) ?? ""
                 let title: String = AX.attribute(child, kAXTitleAttribute) ?? ""
-                ownerCache[id] = Owner(
+                matched.append((id, child, cf, Owner(
                     pid: pid,
                     appName: app.localizedName ?? app.bundleIdentifier ?? "未知",
                     detail: desc.isEmpty ? title : desc
-                )
+                )))
                 pending.remove(id)
             }
         }
+        // 反查要好几秒，期间图标可能在挪（比如启动时本软件图标插进来，其余图标整体左移），
+        // 这时窗口位置和辅助功能位置不是同一时刻的，会配错。窗口和元素位置都没变才记下，变了的下次扫描再认。
+        func same(_ a: CGRect, _ b: CGRect) -> Bool {
+            abs(a.minX - b.minX) <= 1 && abs(a.minY - b.minY) <= 1 && abs(a.width - b.width) <= 1
+        }
+        var unstable = 0
+        for m in matched {
+            guard let wf = frames[m.id], let nowWindow = WindowServer.frame(of: m.id), same(wf, nowWindow),
+                  let nowElement = AX.frame(of: m.element), same(m.axFrame, nowElement) else {
+                Log.debug("Scan", "认归属时图标在挪，先不记 wid=\(m.id) \(m.owner.appName)")
+                unstable += 1
+                continue
+            }
+            ownerCache[m.id] = m.owner
+        }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        Log.debug("Scan", "反查归属 \(windowIDs.count) 个，未匹配 \(pending.count) 个，耗时 \(ms)ms")
+        Log.debug("Scan", "反查归属 \(windowIDs.count) 个，未匹配 \(pending.count) 个，位置在变 \(unstable) 个，耗时 \(ms)ms")
     }
 
     /// 最前面那个 app 的菜单（「文件」「编辑」…）右边界。被它盖住的图标也算看不到。

@@ -20,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var queuedShowAnchor: NSRect?
     private var ownHiddenCount = 0
     private var warnedOwnHidden = false
+    /// 切换桌面或进出全屏的次数，扫描期间变了说明结果可能混着新旧两套图标
+    private var spaceGeneration = 0
+    /// 切换后菜单栏要过一会儿才稳定，这之前不检查本软件图标是否被挤掉
+    private var ownCheckPausedUntil: Date = .distantPast
 
     private static let autosaveName = "MBMV3.Main"
 
@@ -69,6 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         BreakReminder.shared.start()
 
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
+        )
         scan()
         scanTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.scan() }
@@ -192,6 +200,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 扫描
 
+    @objc private func activeSpaceChanged() {
+        spaceGeneration += 1
+        ownHiddenCount = 0
+        ownCheckPausedUntil = Date().addingTimeInterval(8)
+        Log.debug("Scan", "切换桌面或进出全屏，暂停检查本软件图标")
+    }
+
     /// showAt：点了本软件图标，扫完后在这个位置弹出列表，并重新截图，保证看到的是图标当前样子
     private func scan(showAt anchor: NSRect? = nil) {
         if isScanning {
@@ -205,10 +220,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isScanning = true
         let ownFrame = ownFrameTopLeft
+        let generation = spaceGeneration
         scanQueue.async { [scanner] in
             let result = scanner.scan(ownFrame: ownFrame, geometry: geometry)
             Task { @MainActor in
                 self.isScanning = false
+                if generation != self.spaceGeneration {
+                    // 扫描期间切换了桌面或进出全屏，结果不可信，丢掉重扫
+                    Log.debug("Scan", "扫描期间切换了桌面，丢弃本次结果")
+                    let showAt = anchor ?? self.queuedShowAnchor
+                    self.queuedShowAnchor = nil
+                    self.scan(showAt: showAt)
+                    return
+                }
                 await self.handleScan(result, showAt: anchor)
                 if let queued = self.queuedShowAnchor {
                     self.queuedShowAnchor = nil
@@ -229,7 +253,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if result.ownWindowID == nil {
             Log.warn("Scan", "没认出本软件图标 ownFrame=\(ownFrameTopLeft.map { "\($0)" } ?? "nil")")
         }
-        ownWindowID = result.ownWindowID ?? ownWindowID
+        // 不沿用上一次的编号：进出全屏后旧编号可能指向已经离开屏幕的旧窗口
+        ownWindowID = result.ownWindowID
         items = result.items
         let hidden = hiddenItems
         let newHidden = Set(hidden.map(\.windowID))
@@ -263,7 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 本软件图标自己被挤掉了就提醒一次（连续两次扫描都看不到才算，避免挪动图标时的瞬间误判）
     private func checkOwnVisibility() {
-        guard let own = ownWindowID else { return }
+        guard let own = ownWindowID, Date() >= ownCheckPausedUntil else {
+            ownHiddenCount = 0
+            return
+        }
         if MenuBarScanner.isWindowVisible(own) {
             ownHiddenCount = 0
             return
